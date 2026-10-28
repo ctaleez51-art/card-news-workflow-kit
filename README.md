@@ -21,6 +21,18 @@ python -m app
 
 결과물은 `outputs/{projectId}/`에 저장됩니다.
 
+### 시험 모드 (이미지 비용 없이 전체 흐름 확인)
+
+`CARDNEWS_IMAGE_MODE`를 `test`로 두고 서버를 켜면 agy를 부르지 않고, 모든 카드에 기존 배경(`assets/ai-news-background.png`)을 씁니다. 조사와 원고 작성은 그대로 Claude가 합니다.
+
+```powershell
+$env:CARDNEWS_IMAGE_MODE = 'test'
+```
+
+실제 이미지를 만들 때는 이 변수를 지정하지 않은 새 PowerShell 창에서 서버를 켭니다.
+
+### 이미지 권한
+
 이미지 권한 시험이 필요할 때만, 해당 실행에 한해 `CARDNEWS_AGY_SKIP_PERMISSIONS=1`을 쓸 수 있습니다. 이 옵션은 이미지 도구만이 아니라 그 `agy` 실행의 도구 요청을 자동 승인합니다.
 
 ### Gemini API 키로 agy 실행 (Windows PowerShell)
