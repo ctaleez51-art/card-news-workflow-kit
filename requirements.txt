@@ -1,0 +1,4 @@
+fastapi>=0.161.0
+uvicorn>=0.32.0
+claude-agent-sdk>=0.2.163
+pillow>=11.0.0

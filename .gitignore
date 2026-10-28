@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+data/projects/
+outputs/
+*.zip
+.DS_Store
+.env
+/card-01.png
+generate_card_openai.py
+test-bg.png
+/교안-*.md
+/HANDOFF-card-news-workflow-kit.md

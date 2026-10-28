@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>학습 기록 → 블로그 초안</title>
+<style>
+body{font-family:Arial,"Malgun Gothic",sans-serif;background:#f7f5ef;color:#1c2b3d;margin:0}
+main{max-width:820px;margin:40px auto;padding:0 20px}
+h1{font-size:32px}section{background:white;padding:24px;margin:18px 0;border-radius:14px;box-shadow:0 2px 12px #0001}
+button,select{font:inherit;padding:10px 14px;margin:6px 4px 6px 0}button{background:#17678d;color:white;border:0;border-radius:8px;cursor:pointer}
+button:disabled{opacity:.5} .candidate{border:1px solid #d6dddf;padding:12px;margin:10px 0;border-radius:8px}
+.warn{color:#a23d22}pre{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6}
+</style>
+<main>
+<h1>학습 기록에서 블로그 초안 만들기</h1>
+<section><h2>1. 기록 선택</h2><select id="file"></select><button id="find">주제 후보 찾기</button><p id="status"></p></section>
+<section id="selection" hidden><h2>2. 주제와 길이 선택</h2><div id="candidates"></div><select id="length"><option value="short">짧게 · 약 800자</option><option value="medium">보통 · 약 1,500자</option><option value="long">길게 · 약 3,000자</option></select><button id="write">초안 쓰기</button></section>
+<section id="result" hidden><h2>3. 초안과 근거</h2><a id="download">초안 내려받기</a><pre id="markdown"></pre></section>
+</main>
+<script>
+let projectId=null;
+const $=id=>document.getElementById(id);
+fetch('/api/files').then(r=>r.json()).then(data=>{for(const name of data.files){const o=document.createElement('option');o.textContent=name;o.value=name;$('file').append(o)}});
+async function post(url,body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await r.json();if(!r.ok)throw Error(data.detail||r.status);return data}
+$('find').onclick=async()=>{try{$('status').textContent='Claude가 기록을 읽는 중입니다…';$('find').disabled=true;$('selection').hidden=true;$('result').hidden=true;const data=await post('/api/candidates',{filename:$('file').value});projectId=data.projectId;if(data.status==='insufficient'){$('status').textContent='자료 부족: '+data.missing.join(' / ');return}$('status').textContent='주제 후보를 골라 주세요.';$('candidates').replaceChildren();data.candidates.forEach((c,i)=>{const d=document.createElement('div');d.className='candidate';const radio=document.createElement('input');radio.type='radio';radio.name='candidate';radio.value=c.id;radio.checked=i===0;const title=document.createElement('strong');title.textContent=c.title;const p=document.createElement('p');p.textContent=c.reason+' · 근거: '+c.evidenceSections.join(', ');d.append(radio,title,p);if(c.publishedMatches.length){const warning=document.createElement('p');warning.className='warn';warning.textContent='발행됨 가능성: '+c.publishedMatches.join(', ');d.append(warning)}$('candidates').append(d)});$('selection').hidden=false}catch(e){$('status').textContent='오류: '+e.message}finally{$('find').disabled=false}};
+$('write').onclick=async()=>{try{$('status').textContent='Claude가 초안을 쓰는 중입니다…';$('write').disabled=true;const chosen=document.querySelector('input[name=candidate]:checked');const data=await post('/api/drafts',{projectId,candidateId:chosen.value,length:$('length').value});$('markdown').textContent=data.markdown;$('download').href='/api/projects/'+projectId+'/files/'+data.file;$('download').download=data.file;$('result').hidden=false;$('status').textContent='문단별 근거 검사를 마쳤습니다.'}catch(e){$('status').textContent='오류: '+e.message}finally{$('write').disabled=false}};
+</script>
+</html>
