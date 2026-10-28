@@ -1,5 +1,38 @@
 const app = document.getElementById("app");
-const state = { projectId: localStorage.getItem("cardnewsProjectId"), project: null, poll: null, lastTopic: null };
+const state = { projectId: sessionStorage.getItem("cardnewsProjectId"), project: null, poll: null, lastTopic: null, cancelling: false, uiError: null };
+
+// 버튼 동작에서 난 오류를 화면에 보여 준다. (예전에는 오류가 조용히 묻혔다)
+function guard(fn) {
+  return async (...args) => {
+    try {
+      state.uiError = null;
+      await fn(...args);
+    } catch (e) {
+      const d = e.payload || {};
+      state.uiError = { message: e.message || "요청이 실패했습니다.", nextActions: d.nextActions || [] };
+      render();
+    }
+  };
+}
+
+function uiErrorPanel() {
+  if (!state.uiError) return "";
+  const acts = (state.uiError.nextActions || []).join(" / ");
+  return `<section class="panel error"><p>${esc(state.uiError.message)}</p>${acts ? `<p class="meta">${esc(acts)}</p>` : ""}</section>`;
+}
+
+function startNew() {
+  sessionStorage.removeItem("cardnewsProjectId");
+  if (state.poll) {
+    clearInterval(state.poll);
+    state.poll = null;
+  }
+  state.projectId = null;
+  state.project = null;
+  state.lastTopic = null;
+  state.uiError = null;
+  render();
+}
 
 function rid() {
   return crypto.randomUUID();
@@ -48,8 +81,8 @@ function render() {
         <div class="row">
           <button id="start">조사 시작</button>
         </div>
-      </section>`;
-    document.getElementById("start").onclick = createAndResearch;
+      </section>${uiErrorPanel()}`;
+    document.getElementById("start").onclick = guard(createAndResearch);
     return;
   }
 
@@ -66,8 +99,9 @@ function render() {
       <p>상태: <strong>${esc(statusText(p))}</strong></p>
       ${p.waitKind === "editorial" && p.status === "waiting_for_user" ? `<div class="row"><button id="editorial-go">이대로 스토리보드 만들기</button>${backButton()}</div>` : ""}
       ${p.status === "interrupted" ? "<p>서버가 재시작되어 작업이 멈췄습니다. 아래에서 이어서 시도하세요.</p>" : ""}
-      ${p.status === "running" ? `<p class="progress">${esc((p.progress.slice(-1)[0] || {}).text || "작업 중")}</p><div class="row"><button class="danger" id="cancel">취소</button></div>` : ""}
+      ${p.status === "running" ? `<p class="progress">${esc((p.progress.slice(-1)[0] || {}).text || "작업 중")}</p><div class="row">${state.cancelling ? `<button class="danger" disabled>취소 중… (진행 중인 작업을 끄는 중)</button>` : `<button class="danger" id="cancel">취소</button>`}</div>` : ""}
     </section>
+    ${uiErrorPanel()}
     ${err ? `<section class="panel error"><p>${esc(err.message)}</p><p class="meta">${esc((err.nextActions || []).join(" / "))}</p>
       <div class="row"><button id="retry">재시도</button>${backButton()}</div></section>` : ""}
     ${p.candidates.length ? renderCandidates(p) : ""}
@@ -78,27 +112,35 @@ function render() {
   `;
 
   const cancel = document.getElementById("cancel");
-  if (cancel) cancel.onclick = async () => {
-    if (p.activeRunId) await api(`/api/runs/${p.activeRunId}/cancel`, { method: "POST", body: "{}" });
+  if (cancel) cancel.onclick = guard(async () => {
+    state.cancelling = true;
+    render();
+    try {
+      if (p.activeRunId) await api(`/api/runs/${p.activeRunId}/cancel`, { method: "POST", body: "{}" });
+    } finally {
+      state.cancelling = false;
+    }
     await refresh();
-  };
+  });
   const retry = document.getElementById("retry");
-  if (retry) retry.onclick = () => retryStage(p);
+  if (retry) retry.onclick = guard(() => retryStage(p));
   const sel = document.getElementById("select-go");
-  if (sel) sel.onclick = submitSelection;
+  if (sel) sel.onclick = guard(submitSelection);
   const ans = document.getElementById("answer-go");
-  if (ans) ans.onclick = submitAnswer;
+  if (ans) ans.onclick = guard(submitAnswer);
   const appr = document.getElementById("approve-board");
-  if (appr) appr.onclick = () => approve("storyboard", p.storyboardVersion);
+  if (appr) appr.onclick = guard(() => approve("storyboard", p.storyboardVersion));
   const edGo = document.getElementById("editorial-go");
-  if (edGo) edGo.onclick = submitEditorial;
+  if (edGo) edGo.onclick = guard(submitEditorial);
   const chg = document.getElementById("change-board");
-  if (chg) chg.onclick = submitStoryboardChange;
-  document.querySelectorAll(".back-btn").forEach((el) => { el.onclick = goBack; });
+  if (chg) chg.onclick = guard(submitStoryboardChange);
+  document.querySelectorAll(".back-btn").forEach((el) => { el.onclick = guard(goBack); });
   const fin = document.getElementById("approve-final");
-  if (fin) fin.onclick = () => approve("final", p.resultVersion);
+  if (fin) fin.onclick = guard(() => approve("final", p.resultVersion));
+  const newBtn = document.getElementById("new-project");
+  if (newBtn) newBtn.onclick = startNew;
   const rev = document.getElementById("revise-go");
-  if (rev) rev.onclick = submitRevision;
+  if (rev) rev.onclick = guard(submitRevision);
 }
 
 function backButton() {
@@ -109,7 +151,7 @@ async function goBack() {
   const p = state.project;
   if (!p) return;
   if (["research", "selection"].includes(p.stage)) {
-    localStorage.removeItem("cardnewsProjectId");
+    sessionStorage.removeItem("cardnewsProjectId");
     state.lastTopic = p.topic;
     state.projectId = null;
     state.project = null;
@@ -306,23 +348,36 @@ function pickChoice(name) {
 }
 
 function renderCards(p) {
-  const phones = p.cards.map((c) => `
-    <div>
-      <div class="phone"><img src="/api/projects/${p.id}/files/${encodeURIComponent(c.file)}?v=${p.resultVersion}" alt="${esc(c.title)}" /></div>
-      <p class="meta">${esc(c.id)} ${c.failed ? "· 이미지 실패" : ""}</p>
-    </div>`).join("");
+  const editable = p.waitKind === "review" && p.status === "waiting_for_user";
+  const phones = p.cards.map((c, i) => {
+    const src = `/api/projects/${p.id}/files/${encodeURIComponent(c.file)}?v=${p.resultVersion}`;
+    return `
+    <div class="card-item">
+      <a class="phone" href="${src}" target="_blank" rel="noopener" title="눌러서 원본 크기로 보기"><img src="${src}" alt="${esc(c.title)}" /></a>
+      <p class="meta">${i + 1}번 카드${c.failed ? " · 이미지 실패" : ""} · 눌러서 크게 보기</p>
+      ${editable && !p.finalApproved ? `<div class="card-edit">
+        <label><input type="checkbox" class="rev-card" value="${esc(c.storyId)}" /> <span>이 카드 수정</span></label>
+        <textarea class="rev-note" data-card="${esc(c.storyId)}" rows="2" placeholder="고칠 글자 내용 (예: 본문을 두 문장으로 줄여 줘)"></textarea>
+        <label><input type="checkbox" class="rev-image" value="${esc(c.storyId)}" ${c.failed ? "checked" : ""} /> <span>이미지도 다시 만들기</span></label>
+      </div>` : ""}
+    </div>`;
+  }).join("");
+  const ex = p.exportFiles;
+  const downloads = p.finalApproved && ex ? `
+    <h3>내려받기</h3>
+    <p><a href="/api/projects/${p.id}/files/cards.zip?v=${p.resultVersion}" download="cards.zip">전체 ZIP</a> · <a href="/api/projects/${p.id}/exports/provenance.md" target="_blank" rel="noopener">출처 기록</a></p>
+    <p class="meta">카드별 PNG: ${(ex.png || []).map((n) => `<a href="/api/projects/${p.id}/exports/${encodeURIComponent(n)}" download="${esc(n)}">${esc(n)}</a>`).join(" · ")}</p>
+    <div class="row"><button id="new-project">새 카드뉴스 만들기</button></div>` : "";
   return `<section class="panel">
-    <h2>미리보기 (1080×1350 축소)</h2>
+    <h2>카드 검수 (1080×1350)</h2>
     <div class="cards">${phones}</div>
-    <label>수정할 카드 ID (쉼표)</label>
-    <input id="rev-ids" type="text" placeholder="s1,s2" />
-    <label>수정 요청</label>
-    <textarea id="rev-text" rows="3" placeholder="3번 카드 본문이 길어. 핵심 조건은 남기고 두 문장으로 줄여 줘"></textarea>
+    ${editable && !p.finalApproved ? `<p class="meta">글자만 고치면 이미지는 그대로 둡니다. 이미지는 '이미지도 다시 만들기'를 체크한 카드만 새로 만듭니다.</p>
     <div class="row">
-      <button class="secondary" id="revise-go">선택한 카드만 수정</button>
-      ${p.waitKind === "review" && p.status !== "running" ? `<button id="approve-final">최종 승인하고 내려받기</button>${backButton()}` : ""}
-    </div>
-    ${p.finalApproved ? `<p><a href="/api/projects/${p.id}/files/cards.zip">ZIP 내려받기</a> · <a href="/api/projects/${p.id}/files/provenance.md">출처 기록</a></p>` : ""}
+      <button class="secondary" id="revise-go">체크한 카드 수정</button>
+      <button id="approve-final">최종 승인하고 내려받기</button>
+      ${backButton()}
+    </div>` : ""}
+    ${downloads}
   </section>`;
 }
 
@@ -330,7 +385,7 @@ async function createAndResearch() {
   const topic = document.getElementById("topic").value.trim();
   const created = await api("/api/projects", { method: "POST", body: JSON.stringify({ topic }) });
   state.projectId = created.projectId;
-  localStorage.setItem("cardnewsProjectId", created.projectId);
+  sessionStorage.setItem("cardnewsProjectId", created.projectId);
   await api(`/api/projects/${created.projectId}/research`, { method: "POST", body: JSON.stringify({ requestId: rid() }) });
   startPoll();
 }
@@ -346,7 +401,7 @@ async function refresh() {
     }
   } catch (e) {
     if (String(e.message).includes("없")) {
-      localStorage.removeItem("cardnewsProjectId");
+      sessionStorage.removeItem("cardnewsProjectId");
       state.projectId = null;
       state.project = null;
       render();
@@ -389,6 +444,13 @@ async function approve(stage, version) {
   });
   if (stage === "final") {
     await api(`/api/projects/${state.projectId}/exports`);
+    // 승인한 결과의 ZIP을 바로 내려받는다.
+    const a = document.createElement("a");
+    a.href = `/api/projects/${state.projectId}/files/cards.zip?t=${Date.now()}`;
+    a.download = "cards.zip";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   }
   startPoll();
 }
@@ -422,14 +484,24 @@ async function submitEditorial() {
 }
 
 async function submitRevision() {
-  const raw = document.getElementById("rev-ids").value;
-  const instruction = document.getElementById("rev-text").value.trim();
-  const cardIds = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  const cardIds = [...document.querySelectorAll(".rev-card:checked")].map((el) => el.value);
+  if (!cardIds.length) throw new Error("수정할 카드를 하나 이상 체크하세요.");
+  const cardNotes = {};
+  document.querySelectorAll(".rev-note").forEach((el) => {
+    if (cardIds.includes(el.dataset.card) && el.value.trim()) cardNotes[el.dataset.card] = el.value.trim();
+  });
+  const regenerateImage = [...document.querySelectorAll(".rev-image:checked")]
+    .map((el) => el.value)
+    .filter((id) => cardIds.includes(id));
+  if (!Object.keys(cardNotes).length && !regenerateImage.length) {
+    throw new Error("고칠 내용을 적거나 '이미지도 다시 만들기'를 체크하세요.");
+  }
   await api(`/api/projects/${state.projectId}/revisions`, {
     method: "POST",
     body: JSON.stringify({
       cardIds,
-      instruction,
+      cardNotes,
+      regenerateImage,
       version: state.project.resultVersion,
       requestId: rid(),
     }),
@@ -448,15 +520,16 @@ async function retryStage(p) {
   } else if (p.stage === "storyboard") {
     await approve("storyboard", p.storyboardVersion);
   } else if (p.cards.length) {
+    // 실패한 카드가 있으면 그 카드 이미지만, 없으면 마지막 수정 요청을 다시 보낸다.
     const failed = p.cards.filter((c) => c.failed).map((c) => c.storyId);
+    const last = p.lastRevision;
+    let body = null;
+    if (failed.length) body = { cardIds: failed, cardNotes: {}, regenerateImage: failed };
+    else if (last) body = { cardIds: last.cardIds, cardNotes: last.cardNotes || {}, instruction: last.instruction || "", regenerateImage: last.regenerateImage || [] };
+    if (!body) throw new Error("다시 시도할 작업이 없습니다. 카드를 체크해 수정 요청을 보내세요.");
     await api(`/api/projects/${p.id}/revisions`, {
       method: "POST",
-      body: JSON.stringify({
-        cardIds: failed.length ? failed : p.cards.map((c) => c.storyId),
-        instruction: "실패한 카드 이미지만 다시 생성하고 글자는 유지해 줘.",
-        version: p.resultVersion,
-        requestId: rid(),
-      }),
+      body: JSON.stringify({ ...body, version: p.resultVersion, requestId: rid() }),
     });
   }
   startPoll();

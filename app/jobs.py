@@ -8,7 +8,7 @@ from typing import Any
 
 from . import store
 from .engine import run_engine
-from .images import ImageGenError, generate_background
+from .images import ImageGenError, generate_background, generate_backgrounds, test_mode
 from .models import new_id, now_iso
 from .paths import cards_dir, export_dir, project_dir, work_dir
 from .prompts import (
@@ -37,6 +37,14 @@ def _error(project: dict[str, Any], code: str, message: str, actions: list[str])
         {"code": code, "message": message, "nextActions": actions}
     ]
     store.save(project)
+
+
+def _actions_for(code: str, default: list[str]) -> list[str]:
+    if code == "usage_limit":
+        return ["Claude 사용 한도가 풀린 뒤 재시도하세요."]
+    if code == "auth_required":
+        return ["Claude CLI에 로그인한 뒤 재시도하세요."]
+    return default
 
 
 def _question_from(raw: dict[str, Any] | None, version: int) -> dict[str, Any] | None:
@@ -98,6 +106,8 @@ _RESTORE_ON_CANCEL = {
 def _restore_after_cancel(project: dict[str, Any], kind: str) -> None:
     """취소하면 작업 전에 기다리던 화면으로 되돌린다."""
     target = _RESTORE_ON_CANCEL.get(kind)
+    if kind == "revise":
+        _restore_revision(project)
     if kind == "research" and project.get("candidates"):
         target = "selection"
     if target == "editorial" and not project.get("editorial"):
@@ -157,7 +167,12 @@ async def _execute(project_id: str, run_id: str, kind: str, extra: dict[str, Any
         elif kind == "produce":
             await do_produce(project_id, extra.get("cardIds"))
         elif kind == "revise":
-            await do_revise(project_id, extra.get("cardIds") or [], extra.get("instruction") or "")
+            await do_revise(
+                project_id,
+                extra.get("cardIds") or [],
+                extra.get("instruction") or "",
+                extra.get("regenerateImage") or [],
+            )
         else:
             project = store.load(project_id)
             if project:
@@ -172,7 +187,9 @@ async def _execute(project_id: str, run_id: str, kind: str, extra: dict[str, Any
         raise
     except Exception as exc:  # noqa: BLE001
         project = store.load(project_id)
-        if project:
+        if project and kind == "revise":
+            _revise_failed(project, "search_failed", f"수정 실패: {exc}", ["다시 수정 요청을 보내세요."])
+        elif project:
             _error(
                 project,
                 "search_failed",
@@ -222,9 +239,7 @@ async def do_research(project_id: str) -> None:
     project = store.load(project_id) or project
     if result.get("status") == "error":
         code = result.get("code") or "search_failed"
-        actions = ["검색 권한과 로그인을 확인한 뒤 조사를 다시 시작하세요."]
-        if code == "auth_required":
-            actions = ["Claude CLI에 로그인한 뒤 조사를 다시 시작하세요."]
+        actions = _actions_for(code, ["검색 권한과 로그인을 확인한 뒤 조사를 다시 시작하세요."])
         _error(project, code, result.get("message") or "조사 실패", actions)
         return
     candidates = result.get("candidates") or []
@@ -266,7 +281,7 @@ async def do_investigate(project_id: str) -> None:
             project,
             result.get("code") or "search_failed",
             result.get("message") or "심층 조사 실패",
-            ["원문 접근과 검색 권한을 확인한 뒤 다시 시도하세요."],
+            _actions_for(result.get("code") or "", ["원문 접근과 검색 권한을 확인한 뒤 다시 시도하세요."]),
         )
         return
     project["investigation"] = result.get("investigation")
@@ -289,7 +304,8 @@ async def do_storyboard(project_id: str, audience: str | None, note: str | None)
     result = await _engine_call(project, storyboard_prompt(audience, note))
     project = store.load(project_id) or project
     if result.get("status") == "error":
-        _error(project, "search_failed", result.get("message") or "스토리보드 실패", ["다시 시도하세요."])
+        code = result.get("code") or "search_failed"
+        _error(project, code, result.get("message") or "스토리보드 실패", _actions_for(code, ["다시 시도하세요."]))
         return
     board = result.get("storyboard") or {"title": "", "cards": []}
     project["storyboard"] = board
@@ -316,7 +332,7 @@ async def do_storyboard_change(project_id: str, instruction: str) -> None:
             project,
             result.get("code") or "search_failed",
             result.get("message") or "스토리보드 변경 실패",
-            ["변경 요청을 다시 보내세요."],
+            _actions_for(result.get("code") or "", ["변경 요청을 다시 보내세요."]),
         )
         project["waitKind"] = "storyboard"
         store.save(project)
@@ -331,68 +347,178 @@ async def do_storyboard_change(project_id: str, instruction: str) -> None:
     store.save(project)
 
 
-async def do_revise(project_id: str, card_ids: list[str], instruction: str) -> None:
+def _revise_failed(project: dict[str, Any], code: str, message: str, actions: list[str]) -> None:
+    """수정이 실패하면 수정 전 기획과 카드로 되돌리고 검수 화면에서 오류를 보여 준다."""
+    _restore_revision(project)
+    project["status"] = "waiting_for_user"
+    project["waitKind"] = "review" if project.get("cards") else "storyboard"
+    project["stage"] = project["waitKind"]
+    project["errors"] = [{"code": code, "message": message, "nextActions": actions}]
+    store.save(project)
+
+
+def _restore_revision(project: dict[str, Any]) -> None:
+    backup = project.pop("revisionBackup", None)
+    if not backup:
+        return
+    project["storyboard"] = backup.get("storyboard")
+    project["storyboardVersion"] = backup.get("storyboardVersion")
+    project["finalApproved"] = bool(backup.get("finalApproved"))
+
+
+async def do_revise(project_id: str, card_ids: list[str], instruction: str, regen_ids: list[str] | None = None) -> None:
     project = store.load(project_id)
     if not project:
         return
-    project["stage"] = "storyboard"
+    old_board = project.get("storyboard") or {"title": "", "cards": []}
+    # 수정 중에도 검수 화면과 기존 카드를 그대로 두고, 실패·취소 때 되돌릴 기획을 보관한다.
+    project["revisionBackup"] = {
+        "storyboard": old_board,
+        "storyboardVersion": project.get("storyboardVersion"),
+        "finalApproved": project.get("finalApproved"),
+    }
+    project["stage"] = "review"
+    project["waitKind"] = None
     project["finalApproved"] = False
     store.save(project)
-    result = await _engine_call(project, revision_prompt(card_ids, instruction))
-    project = store.load(project_id) or project
-    if result.get("status") == "error":
-        _error(project, "search_failed", result.get("message") or "수정 실패", ["수정 요청을 다시 보내세요."])
-        return
-    board = result.get("storyboard") or project.get("storyboard")
-    project["storyboard"] = board
-    project["storyboardVersion"] = int(project.get("storyboardVersion") or 1) + 1
-    store.save(project)
-    await do_produce(project_id, card_ids)
+
+    if instruction.strip():
+        result = await _engine_call(project, revision_prompt(card_ids, instruction))
+        project = store.load(project_id) or project
+        board = result.get("storyboard") or {}
+        if result.get("status") == "error" or not board.get("cards"):
+            code = result.get("code") or "search_failed"
+            actions = ["고칠 내용을 확인하고 다시 수정 요청을 보내세요."]
+            if code == "usage_limit":
+                actions = ["Claude 사용 한도가 풀린 뒤 다시 수정 요청을 보내세요."]
+            _revise_failed(project, code, result.get("message") or "글자 수정 결과를 받지 못했습니다.", actions)
+            return
+        # 지정한 카드만 새 내용으로 바꾸고, 나머지 카드는 이전 기획을 그대로 쓴다.
+        new_by_id = {c.get("id"): c for c in board["cards"]}
+        merged = [
+            new_by_id.get(c.get("id"), c) if c.get("id") in card_ids else c
+            for c in old_board.get("cards") or []
+        ]
+        project["storyboard"] = {**old_board, "cards": merged}
+        project["storyboardVersion"] = int(project.get("storyboardVersion") or 1) + 1
+        store.save(project)
+
+    await do_produce(project_id, card_ids, regen_ids or [])
+    project = store.load(project_id)
+    if project and project.pop("revisionBackup", None) is not None:
+        store.save(project)
 
 
-async def do_produce(project_id: str, only_ids: list[str] | None) -> None:
+def _existing_background(project_id: str, card: dict[str, Any] | None) -> Path | None:
+    """이미 만든 카드의 배경 그림 파일. 글자만 고칠 때 다시 쓴다."""
+    if not card or card.get("failed"):
+        return None
+    wdir = work_dir(project_id)
+    if card.get("background"):
+        path = wdir / card["background"]
+        return path if path.exists() else None
+    legacy = wdir / f"bg-{int(card.get('index') or 0):02d}.png"
+    return legacy if legacy.exists() else None
+
+
+async def do_produce(project_id: str, only_ids: list[str] | None = None, regen_ids: list[str] | None = None) -> None:
+    """카드를 만든다. only_ids가 있으면 그 카드만 다시 만들고 나머지는 그대로 둔다.
+
+    결과는 끝까지 만든 뒤에 한 번에 저장한다. 중간에 취소·실패해도 기존 카드는 지워지지 않는다.
+    새 파일은 버전 번호를 붙여 저장해 기존 카드 파일을 덮어쓰지 않는다.
+    """
     project = store.load(project_id)
     if not project or not project.get("storyboard"):
         return
-    project["stage"] = "produce"
+    revising = only_ids is not None
+    if not revising:
+        project["stage"] = "produce"
     project["waitKind"] = None
     store.save(project)
+
     cards_spec = list((project["storyboard"] or {}).get("cards") or [])
     existing = {c.get("storyId"): c for c in project.get("cards") or []}
-    produced: list[dict[str, Any]] = []
+    version = int(project.get("resultVersion") or 1) + 1
+    regen = set(regen_ids or [])
     cdir = cards_dir(project_id)
     wdir = work_dir(project_id)
-    stop: ImageGenError | None = None
+
+    plan: list[dict[str, Any]] = []
+    gen_items: list[tuple[str, str, Path]] = []
     for index, spec in enumerate(cards_spec, start=1):
         sid = spec.get("id") or f"s{index}"
-        if only_ids and sid not in only_ids and existing.get(sid):
-            produced.append(existing[sid])
+        old = existing.get(sid)
+        if revising and sid not in only_ids and old:
+            plan.append({"keep": old})
             continue
-        raw_path = wdir / f"bg-{index:02d}.png"
-        dest = cdir / f"card-{index:02d}.png"
-        image_meta: dict[str, Any] | None = None
+        reuse = _existing_background(project_id, old) if (revising and sid not in regen) else None
+        plan.append({"sid": sid, "index": index, "spec": spec, "reuse": reuse, "old": old})
+        if reuse is None:
+            scene = spec.get("imagePlan") or spec.get("title") or ""
+            gen_items.append((sid, scene, wdir / f"bg-{index:02d}-v{version}.png"))
+
+    results: dict[str, Any] = {}
+    stop: ImageGenError | None = None
+    if gen_items:
+        mode = "시험 모드: 기존 배경 사용" if test_mode() else "agy 1회 실행"
+        _append_progress(store.load(project_id) or project, f"이미지 {len(gen_items)}장 생성 시작 ({mode})")
+
+        def on_saved(done: int, total: int) -> None:
+            _append_progress(store.load(project_id) or project, f"이미지 {done}/{total}장 저장됨")
+
+        results = await generate_backgrounds(project_id, gen_items, on_saved)
+        for value in results.values():
+            if isinstance(value, ImageGenError) and value.stop_all:
+                stop = value
+                break
+        if not stop:
+            # 묶음 실행에서 빠진 카드만 한 장씩 다시 요청한다.
+            for sid, scene, dest in gen_items:
+                value = results.get(sid)
+                if not isinstance(value, ImageGenError):
+                    continue
+                _append_progress(store.load(project_id) or project, f"빠진 이미지 다시 생성: {dest.name}")
+                try:
+                    results[sid] = await generate_background(project_id, sid, scene, dest)
+                except ImageGenError as exc:
+                    results[sid] = exc
+                    if exc.stop_all:
+                        stop = exc
+                        break
+
+    produced: list[dict[str, Any]] = []
+    failed_names: list[str] = []
+    for entry in plan:
+        if "keep" in entry:
+            produced.append(entry["keep"])
+            continue
+        sid, index, spec = entry["sid"], entry["index"], entry["spec"]
         fail_msg = None
-        if stop:
-            # 앞 카드에서 한도 초과·권한·로그인 문제가 났으므로 agy를 부르지 않는다.
-            fail_msg = "앞 카드의 오류 때문에 이 카드는 이미지를 요청하지 않았습니다."
-            image_meta = {"generated": False, "error": fail_msg, "code": "skipped"}
+        if entry["reuse"] is not None:
+            background: Path | None = entry["reuse"]
+            image_meta = (entry["old"] or {}).get("image")
         else:
-            _append_progress(store.load(project_id) or project, f"카드 {index} 이미지 생성")
-            try:
-                image_meta = await generate_background(
-                    project_id, sid, spec.get("imagePlan") or spec.get("title") or "", raw_path
-                )
-            except ImageGenError as exc:
-                fail_msg = exc.message
-                image_meta = {"generated": False, "error": exc.message, "code": exc.code}
-                if exc.stop_all:
-                    stop = exc
+            value = results.get(sid)
+            if isinstance(value, ImageGenError):
+                fail_msg = value.message if not (stop and value is not stop) else "앞 카드의 오류 때문에 이 카드는 이미지를 만들지 못했습니다."
+                image_meta = {"generated": False, "error": value.message, "code": value.code}
+                background = None
+                failed_names.append(f"{index}번")
+            elif value is None:
+                fail_msg = "앞 카드의 오류 때문에 이 카드는 이미지를 요청하지 않았습니다."
+                image_meta = {"generated": False, "error": fail_msg, "code": "skipped"}
+                background = None
+                failed_names.append(f"{index}번")
+            else:
+                image_meta = value
+                background = Path(value["path"])
         source = spec.get("source") or ""
         footer = f"출처: {source}" if source else "출처 미기재"
         if project.get("researchAsOf"):
             footer += f" · 조사 {project['researchAsOf'][:10]}"
+        dest = cdir / f"card-{index:02d}-v{version}.png"
         render_meta = render_card(
-            raw_path if raw_path.exists() else None,
+            background,
             spec.get("title") or spec.get("headline") or "",
             spec.get("body") or spec.get("headline") or "",
             footer,
@@ -408,39 +534,43 @@ async def do_produce(project_id: str, only_ids: list[str] | None) -> None:
                 "headline": spec.get("headline"),
                 "body": spec.get("body"),
                 "source": source,
-                "file": f"card-{index:02d}.png",
+                "file": dest.name,
+                "background": background.name if background else None,
                 "render": render_meta,
                 "image": image_meta,
                 "failed": bool(fail_msg),
             }
         )
-        project = store.load(project_id) or project
-        project["cards"] = produced
-        store.save(project)
 
     project = store.load(project_id) or project
     project["cards"] = produced
-    project["resultVersion"] = int(project.get("resultVersion") or 1) + 1
+    project["resultVersion"] = version
     project["finalApproved"] = False
     project["stage"] = "review"
+    project["status"] = "waiting_for_user"
+    project["waitKind"] = "review"
+    project["errors"] = []
     if stop:
         reason = {
             "quota_exceeded": "이미지 생성 한도를 초과했습니다.",
             "permission_denied": "agy가 필요한 권한을 받지 못했습니다.",
-            "auth_required": "agy 로그인이 필요합니다.",
+            "auth_required": "agy 로그인 또는 API 키 설정이 필요합니다.",
         }.get(stop.code, "이미지 생성에 실패했습니다.")
-        project["status"] = "error"
-        project["waitKind"] = None
         project["errors"] = [
             {
                 "code": stop.code,
-                "message": f"{reason} 남은 카드는 이미지를 요청하지 않고 멈췄습니다.",
-                "nextActions": ["원인을 해결한 뒤 재시도하세요."],
+                "message": f"{reason} {', '.join(failed_names)} 카드는 이미지가 없습니다.",
+                "nextActions": ["원인을 해결한 뒤 재시도를 누르면 실패한 카드만 다시 만듭니다."],
             }
         ]
-    else:
-        project["status"] = "waiting_for_user"
-        project["waitKind"] = "review"
+    elif failed_names:
+        project["errors"] = [
+            {
+                "code": "image_failed",
+                "message": f"{', '.join(failed_names)} 카드 이미지를 만들지 못했습니다.",
+                "nextActions": ["재시도를 누르면 실패한 카드만 다시 만듭니다."],
+            }
+        ]
     store.save(project)
 
 
@@ -448,17 +578,22 @@ def write_export(project: dict[str, Any]) -> dict[str, Any]:
     pid = project["id"]
     ed = export_dir(pid)
     ed.mkdir(parents=True, exist_ok=True)
+    # 이전 승인 때 만든 내보내기 파일이 섞이지 않게 비운다.
+    for old in ed.glob("*.png"):
+        old.unlink()
     cd = cards_dir(pid)
     files = []
+    pairs = []
     for card in project.get("cards") or []:
         src = cd / card["file"]
         if src.exists():
-            dest = ed / card["file"]
-            dest.write_bytes(src.read_bytes())
-            files.append(card["file"])
+            name = f"card-{int(card.get('index') or len(files) + 1):02d}.png"
+            (ed / name).write_bytes(src.read_bytes())
+            files.append(name)
+            pairs.append((name, card))
     prov = ed / "provenance.md"
     lines = [
-        f"# 출처와 이미지 기록",
+        "# 출처와 이미지 기록",
         f"- 주제: {project.get('topic')}",
         f"- 조사 기준: {project.get('researchAsOf')}",
         f"- 기간: {project.get('periodDays')}일",
@@ -470,10 +605,10 @@ def write_export(project: dict[str, Any]) -> dict[str, Any]:
         if c.get("id") in selected:
             lines.append(f"- {c.get('title')} ({c.get('publishedAt')}) {c.get('url')}")
     lines += ["", "## 카드"]
-    for card in project.get("cards") or []:
+    for name, card in pairs:
         img = card.get("image") or {}
         lines.append(
-            f"- {card.get('file')}: 생성={img.get('generated')} 도구={img.get('tool')} 날짜={img.get('createdAt')} 프롬프트={img.get('prompt')}"
+            f"- {name}: 생성={img.get('generated')} 도구={img.get('tool')} 날짜={img.get('createdAt')} 프롬프트={img.get('prompt')}"
         )
         lines.append(f"  근거: {card.get('source')}")
     prov.write_text("\n".join(lines), encoding="utf-8")
@@ -482,8 +617,10 @@ def write_export(project: dict[str, Any]) -> dict[str, Any]:
         for name in files:
             zf.write(ed / name, arcname=name)
         zf.write(prov, arcname="provenance.md")
-    return {
+    listing = {
         "png": files,
         "zip": "cards.zip",
         "provenance": "provenance.md",
     }
+    project["exportFiles"] = listing
+    return listing

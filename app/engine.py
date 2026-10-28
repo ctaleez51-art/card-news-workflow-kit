@@ -20,6 +20,19 @@ from .prompts import RESULT_FILE
 ProgressFn = Callable[[str], None]
 
 
+def classify_engine_error(text: str, is_error: bool = True) -> str:
+    """엔진 오류 문장을 앱의 오류 코드로 바꾼다."""
+    low = (text or "").lower()
+    if any(k in low for k in ("session limit", "usage limit", "hit your limit", "rate limit", "limit reached")):
+        return "usage_limit"
+    if is_error and any(k in low for k in ("login", "log in", "authenticat", "api key")):
+        return "auth_required"
+    return "search_failed"
+
+
+USAGE_LIMIT_MESSAGE = "Claude 사용 한도에 도달했습니다. 한도가 풀린 뒤 다시 시도하세요."
+
+
 def _extract_json(text: str) -> dict[str, Any] | None:
     text = text.strip()
     if not text:
@@ -95,10 +108,13 @@ async def run_engine(
                     parsed["engineSessionId"] = new_session
                     return parsed
     except Exception as exc:  # noqa: BLE001 — surface engine failures to the UI
+        detail = f"{exc} {' '.join(texts[-3:])}"
+        code = classify_engine_error(detail)
+        prefix = USAGE_LIMIT_MESSAGE + " " if code == "usage_limit" else ""
         return {
             "status": "error",
-            "code": "search_failed",
-            "message": f"엔진 호출 실패: {type(exc).__name__}: {exc}",
+            "code": code,
+            "message": f"{prefix}엔진 호출 실패: {type(exc).__name__}: {exc}",
             "engineSessionId": new_session,
         }
 
@@ -111,11 +127,16 @@ async def run_engine(
     if parsed is None:
         parsed = _extract_json("\n".join(texts))
     if parsed is None:
-        code = "auth_required" if is_error and "login" in (error_text or "").lower() else "search_failed"
+        detail = f"{error_text} {' '.join(texts[-3:])}"
+        code = classify_engine_error(detail, is_error)
+        message = error_text or "엔진이 구조화된 결과를 반환하지 않았습니다. 로그인·검색 권한을 확인하세요."
+        if code == "usage_limit":
+            raw = error_text or (texts[-1] if texts else "")
+            message = f"{USAGE_LIMIT_MESSAGE} ({raw.strip()[:200]})"
         return {
             "status": "error",
             "code": code,
-            "message": error_text or "엔진이 구조화된 결과를 반환하지 않았습니다. 로그인·검색 권한을 확인하세요.",
+            "message": message,
             "engineSessionId": new_session,
         }
     parsed["engineSessionId"] = new_session

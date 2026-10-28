@@ -114,6 +114,7 @@ def storyboard_prompt(audience: str | None, extra: str | None) -> str:
 보통 5~8장. 표지는 관심, 본문은 장마다 핵심 하나, 마지막은 요약 또는 다음 행동.
 근거 없는 순위·수치·과장 금지.
 각 카드에 역할, 제목, 핵심 문장, 짧은 본문, 근거 URL, 그림 계획(글자 없는 장면)을 적으세요.
+본문은 180자 이내로 쓰세요. 그림체와 색은 앱이 모든 카드에 똑같이 정하므로 그림 계획에는 장면만 쓰세요.
 
 {JSON_RULES}
 
@@ -130,7 +131,7 @@ def storyboard_prompt(audience: str | None, extra: str | None) -> str:
         "headline": "",
         "body": "",
         "source": "URL 또는 조사 기록",
-        "imagePlan": "글자 없는 장면 설명, 여백, 색감"
+        "imagePlan": "글자 없는 장면 하나를 구체적인 사물과 상황으로 설명 (그림체·색·여백은 쓰지 않음)"
       }}
     ]
   }}
@@ -166,7 +167,7 @@ def storyboard_change_prompt(instruction: str) -> str:
         "headline": "",
         "body": "",
         "source": "URL 또는 조사 기록",
-        "imagePlan": "글자 없는 장면 설명, 여백, 색감"
+        "imagePlan": "글자 없는 장면 하나를 구체적인 사물과 상황으로 설명 (그림체·색·여백은 쓰지 않음)"
       }}
     ]
   }}

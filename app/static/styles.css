@@ -53,21 +53,23 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .candidate a { color: var(--cobalt); }
 .story { border-left: 4px solid var(--cobalt); padding-left: 12px; margin: 12px 0; }
 .cards {
-  display: flex;
-  gap: 16px;
-  overflow-x: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 20px;
   padding-bottom: 8px;
 }
+.card-item { min-width: 0; }
 .phone {
-  width: 216px;
-  height: 270px;
-  flex: 0 0 auto;
+  display: block;
+  width: 100%;
+  aspect-ratio: 1080 / 1350;
   border-radius: 12px;
   overflow: hidden;
   border: 1px solid var(--line);
   background: #fff;
 }
-.phone img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.phone img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.card-edit textarea { width: 100%; box-sizing: border-box; font: inherit; }
 .progress { font-size: 13px; color: var(--muted); }
 .options { display: grid; gap: 8px; margin: 12px 0; }
 .options label { font-weight: 500; display: flex; gap: 8px; align-items: flex-start; }

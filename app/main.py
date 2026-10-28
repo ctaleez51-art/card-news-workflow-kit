@@ -76,9 +76,22 @@ def _change_instruction(body: StoryboardChangeBody) -> str:
 
 class RevisionBody(BaseModel):
     cardIds: list[str]
-    instruction: str
+    instruction: str = ""
+    cardNotes: dict[str, str] = {}
+    regenerateImage: list[str] = []
     version: int
     requestId: str
+
+
+def _revision_instruction(body: RevisionBody) -> str:
+    lines = []
+    for cid in body.cardIds:
+        note = (body.cardNotes.get(cid) or "").strip()
+        if note:
+            lines.append(f"카드 {cid}: {note}")
+    if body.instruction.strip():
+        lines.append(body.instruction.strip())
+    return "\n".join(lines)
 
 
 def _idempotent(project: dict[str, Any], request_id: str, payload: Any) -> dict[str, Any] | None:
@@ -128,6 +141,8 @@ def _public(project: dict[str, Any]) -> dict[str, Any]:
         "cards": project.get("cards") or [],
         "resultVersion": project.get("resultVersion"),
         "finalApproved": project.get("finalApproved"),
+        "exportFiles": project.get("exportFiles") if project.get("finalApproved") else None,
+        "lastRevision": project.get("lastRevision"),
         "activeRunId": project.get("activeRunId"),
         "errors": project.get("errors") or [],
         "createdAt": project.get("createdAt"),
@@ -414,18 +429,39 @@ async def revisions(project_id: str, body: RevisionBody) -> dict[str, Any]:
     cached = _idempotent(project, body.requestId, payload)
     if cached:
         return cached
-    if body.version != project.get("resultVersion") and body.version != project.get("storyboardVersion"):
-        raise HTTPException(status_code=409, detail={"code": "stale_question", "message": "버전이 바뀌었습니다."})
     if project.get("status") == "running":
         result = {"runId": project.get("activeRunId"), "status": "running"}
         _remember(project, body.requestId, payload, result)
         return result
-    project["finalApproved"] = False
+    if body.version != project.get("resultVersion"):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "stale_question", "message": "카드가 바뀌었습니다. 화면을 새로고침하세요.", "nextActions": ["새로고침"]},
+        )
+    known = {c.get("id") for c in (project.get("storyboard") or {}).get("cards") or []}
+    card_ids = [cid for cid in body.cardIds if cid in known]
+    if not card_ids:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_answer", "message": "수정할 카드를 하나 이상 체크하세요.", "nextActions": []},
+        )
+    regen = [cid for cid in body.regenerateImage if cid in card_ids]
+    instruction = _revision_instruction(body)
+    if not instruction and not regen:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_answer",
+                "message": "고칠 내용을 적거나 '이미지도 다시 만들기'를 체크하세요.",
+                "nextActions": [],
+            },
+        )
+    project["lastRevision"] = {"cardIds": card_ids, "cardNotes": body.cardNotes, "instruction": body.instruction, "regenerateImage": regen}
     store.save(project)
     run_id = jobs.start_run(
         project_id,
         "revise",
-        {"cardIds": body.cardIds, "instruction": body.instruction},
+        {"cardIds": card_ids, "instruction": instruction, "regenerateImage": regen},
     )
     result = {"runId": run_id, "status": "running"}
     project = store.load(project_id) or project
@@ -449,7 +485,22 @@ def exports(project_id: str) -> dict[str, Any]:
             detail={"code": "invalid_answer", "message": "최종 승인된 버전만 내려받을 수 있습니다."},
         )
     listing = jobs.write_export(project)
+    store.save(project)
     return listing
+
+
+@app.get("/api/projects/{project_id}/exports/{name}")
+def export_file(project_id: str, name: str) -> FileResponse:
+    """최종 승인된 내보내기 파일(카드별 PNG·출처 기록)만 내려준다."""
+    project = store.load(project_id)
+    if not project or not project.get("finalApproved"):
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "최종 승인된 파일이 없습니다."})
+    if "/" in name or "\\" in name or ".." in name:
+        raise HTTPException(status_code=400, detail={"code": "invalid_answer", "message": "잘못된 파일 이름입니다."})
+    path = export_dir(project_id) / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "파일이 없습니다."})
+    return FileResponse(path, filename=name)
 
 
 @app.get("/api/projects/{project_id}/files/{name}")
